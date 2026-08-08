@@ -1,0 +1,16 @@
+[package]
+name = "shanhai_client"
+version = "0.1.0"
+edition = "2021"
+description = "ShanHai RabbitChain-native client skeleton (bevy fork app/ecs/log only, no renderer)"
+
+[dependencies]
+bevy_app = { path = "../bevy_app" }
+bevy_ecs = { path = "../bevy_ecs" }
+bevy_log = { path = "../bevy_log" }
+shanhai-core = { path = "../../../shanhai-onchain-mmo/shanhai-core" }
+rabbit_client = { path = "../rabbit_client" }
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+serde_json = "1"
