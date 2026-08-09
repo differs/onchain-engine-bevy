@@ -117,6 +117,21 @@ impl RpcClient {
     pub async fn gas_price(&self) -> Result<Value, RpcError> {
         self.call("rabbit_gasPrice", json!([])).await
     }
+
+    /// `rabbit_getTreasury`：国库地址 + 账户余额 + 治理账本（收入/支出/生效产物）。
+    pub async fn get_treasury(&self) -> Result<Value, RpcError> {
+        self.call("rabbit_getTreasury", json!([])).await
+    }
+
+    /// `rabbit_increaseTime`：推进节点虚拟时钟（testkit 测试框架；anvil 时间跳跃对应物）。
+    pub async fn increase_time(&self, secs: u64) -> Result<Value, RpcError> {
+        self.call("rabbit_increaseTime", json!([secs])).await
+    }
+
+    /// `rabbit_getLatestBlock`：最新区块（含 header timestamp）。
+    pub async fn latest_block(&self) -> Result<Value, RpcError> {
+        self.call("rabbit_getLatestBlock", json!([])).await
+    }
 }
 
 #[cfg(test)]
