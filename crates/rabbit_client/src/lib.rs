@@ -133,9 +133,19 @@ impl RpcClient {
         self.call("rabbit_increaseTime", json!([secs])).await
     }
 
-    /// `rabbit_fundAccount`：水龙头（testkit；节点需 --enable-time-travel）给地址注入原生余额。
+    /// `rabbit_getTokenBalance`：查询任意代币余额（token_id 0=原生 / 1=SHC / 1+ 游戏代币）。
+    pub async fn get_token_balance(&self, address: &str, token_id: u64) -> Result<Value, RpcError> {
+        self.call("rabbit_getTokenBalance", json!([address, token_id])).await
+    }
+
+    /// `rabbit_fundAccount`：水龙头（testkit；节点需 --enable-time-travel）给地址注入代币余额。
     pub async fn fund_account(&self, address: &str, amount: u64) -> Result<Value, RpcError> {
-        self.call("rabbit_fundAccount", json!([address, amount])).await
+        self.call("rabbit_fundAccount", json!([address, amount, 0])).await
+    }
+
+    /// `rabbit_fundAccount`：给任意代币（如 SHC token_id=1）注资。
+    pub async fn fund_token(&self, address: &str, amount: u64, token_id: u64) -> Result<Value, RpcError> {
+        self.call("rabbit_fundAccount", json!([address, amount, token_id])).await
     }
 
     /// `rabbit_getLatestBlock`：最新区块（含 header timestamp）。
