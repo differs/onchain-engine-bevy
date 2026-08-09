@@ -123,6 +123,11 @@ impl RpcClient {
         self.call("rabbit_getTreasury", json!([])).await
     }
 
+    /// `rabbit_getAccount`：查询账户余额（山海币 SHC 原生账户资产）。
+    pub async fn get_account(&self, address: &str) -> Result<Value, RpcError> {
+        self.call("rabbit_getAccount", json!([address])).await
+    }
+
     /// `rabbit_increaseTime`：推进节点虚拟时钟（testkit 测试框架；anvil 时间跳跃对应物）。
     pub async fn increase_time(&self, secs: u64) -> Result<Value, RpcError> {
         self.call("rabbit_increaseTime", json!([secs])).await
