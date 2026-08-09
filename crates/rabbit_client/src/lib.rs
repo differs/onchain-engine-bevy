@@ -133,6 +133,11 @@ impl RpcClient {
         self.call("rabbit_increaseTime", json!([secs])).await
     }
 
+    /// `rabbit_fundAccount`：水龙头（testkit；节点需 --enable-time-travel）给地址注入原生余额。
+    pub async fn fund_account(&self, address: &str, amount: u64) -> Result<Value, RpcError> {
+        self.call("rabbit_fundAccount", json!([address, amount])).await
+    }
+
     /// `rabbit_getLatestBlock`：最新区块（含 header timestamp）。
     pub async fn latest_block(&self) -> Result<Value, RpcError> {
         self.call("rabbit_getLatestBlock", json!([])).await
