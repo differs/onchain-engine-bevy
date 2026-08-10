@@ -152,6 +152,12 @@ impl RpcClient {
     pub async fn latest_block(&self) -> Result<Value, RpcError> {
         self.call("rabbit_getLatestBlock", json!([])).await
     }
+
+    /// `rabbit_getBlockByNumber`：按高度查块（不含 body）。用于非托管结算取
+    /// 稳定块作为随机源（latest 在快速矿工下可能被同高度新块覆盖）。
+    pub async fn get_block_by_number(&self, number: u64) -> Result<Value, RpcError> {
+        self.call("rabbit_getBlockByNumber", json!([number])).await
+    }
 }
 
 #[cfg(test)]
