@@ -19,11 +19,19 @@ fn main() {
         config.sync_every_ticks = ticks;
     }
 
+    // SH_CHAIN_FLOW=1 时：跑一帧执行完整链上流程后退出（供 client_e2e.sh 断言）。
+    // 否则：骨架循环运行（确定性 tick + 对象同步）。
+    let runner = if std::env::var("SH_CHAIN_FLOW").ok().as_deref() == Some("1") {
+        ScheduleRunnerPlugin::run_once()
+    } else {
+        ScheduleRunnerPlugin::run_loop(Duration::from_millis(100))
+    };
+
     App::new()
         .add_plugins((
             NoopPluginGroup,
             LogPlugin::default(),
-            ScheduleRunnerPlugin::run_loop(Duration::from_millis(100)),
+            runner,
         ))
         .add_plugins(RabbitChainPlugin::with_config(config))
         .run();
