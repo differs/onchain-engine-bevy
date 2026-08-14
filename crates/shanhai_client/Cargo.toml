@@ -15,5 +15,5 @@ ed25519-dalek = "2.1"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
 chrono = "0.4"

@@ -30,38 +30,60 @@ struct RpcRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-struct RpcResponse {
-    result: Option<Value>,
-    error: Option<RpcErrorBody>,
-}
-
-#[derive(Debug, Deserialize)]
 struct RpcErrorBody {
     code: i64,
     message: String,
     data: Option<Value>,
 }
 
+/// 解析 JSON-RPC 响应：error 优先；`result` 字段缺失 = 异常响应。
+/// 注意 `"result": null` 是**合法**响应（节点对"对象不存在"等查询返回 null，
+/// 见 `rabbit_getObject`），必须与字段缺失区分——前者返回 `Ok(Value::Null)`。
+fn parse_rpc_response(body: &str) -> Result<Value, RpcError> {
+    let resp: Value = serde_json::from_str(body)
+        .map_err(|e| RpcError::BadResponse(format!("malformed response: {e}")))?;
+    if let Some(err) = resp.get("error") {
+        let err: RpcErrorBody = serde_json::from_value(err.clone())
+            .map_err(|e| RpcError::BadResponse(format!("malformed error object: {e}")))?;
+        return Err(RpcError::Remote {
+            code: err.code,
+            message: err.message,
+            data: err.data,
+        });
+    }
+    match resp.get("result") {
+        Some(v) => Ok(v.clone()),
+        None => Err(RpcError::BadResponse("missing result".into())),
+    }
+}
+
 /// 连接单个 RabbitChain 节点的 JSON-RPC 客户端。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcClient {
     url: String,
     token: Option<String>,
     http: reqwest::Client,
-    next_id: std::sync::atomic::AtomicU64,
+    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RpcClient {
     pub fn new(url: impl Into<String>, token: Option<String>) -> Self {
+        // 总超时 15s + 连接超时 5s：防止悬挂请求永久占住后台 worker task。
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client build");
         Self {
             url: url.into(),
             token,
-            http: reqwest::Client::new(),
-            next_id: std::sync::atomic::AtomicU64::new(1),
+            http,
+            next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+    /// 底层 JSON-RPC 调用（供高级/扩展方法使用；sh 客户端后台 worker 也走这里）。
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -77,15 +99,8 @@ impl RpcClient {
         if let Some(tok) = &self.token {
             req = req.header("x-rabbit-token", tok);
         }
-        let resp: RpcResponse = req.send().await?.json().await?;
-        if let Some(err) = resp.error {
-            return Err(RpcError::Remote {
-                code: err.code,
-                message: err.message,
-                data: err.data,
-            });
-        }
-        resp.result.ok_or_else(|| RpcError::BadResponse("missing result".into()))
+        let body = req.send().await?.text().await?;
+        parse_rpc_response(&body)
     }
 
     /// `rabbit_getObject`：查询逻辑对象最新版本。
@@ -181,16 +196,32 @@ mod tests {
     #[test]
     fn parses_remote_error() {
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"token required"}}"#;
-        let resp: RpcResponse = serde_json::from_str(body).unwrap();
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, -32001);
-        assert!(resp.result.is_none());
+        let err = parse_rpc_response(body).unwrap_err();
+        match err {
+            RpcError::Remote { code, .. } => assert_eq!(code, -32001),
+            _ => panic!("expected remote error, got {err:?}"),
+        }
     }
 
     #[test]
     fn parses_success_result() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
-        let resp: RpcResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(resp.result.unwrap()["ok"], true);
+        let v = parse_rpc_response(body).expect("parse");
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn parses_null_result_as_success() {
+        // 对象不存在等合法查询：result 为 null（区别于字段缺失）
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let v = parse_rpc_response(body).expect("parse");
+        assert!(v.is_null());
+    }
+
+    #[test]
+    fn distinguishes_missing_result_field() {
+        let body = r#"{"jsonrpc":"2.0","id":1}"#;
+        let err = parse_rpc_response(body).unwrap_err();
+        assert!(matches!(err, RpcError::BadResponse(_)));
     }
 }

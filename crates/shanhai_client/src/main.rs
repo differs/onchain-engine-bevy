@@ -15,17 +15,18 @@ fn main() {
     if let Ok(object_id) = std::env::var("SH_SYNC_OBJECT") {
         config.object_id = Some(object_id);
     }
+    if let Ok(chain_id) = std::env::var("SH_CHAIN_ID").map(|v| v.parse::<u64>().unwrap_or(10088)) {
+        config.chain_id = chain_id;
+    }
     if let Ok(ticks) = std::env::var("SH_SYNC_TICKS").map(|v| v.parse::<u32>().unwrap_or(60)) {
         config.sync_every_ticks = ticks;
     }
 
-    // SH_CHAIN_FLOW=1 时：跑一帧执行完整链上流程后退出（供 client_e2e.sh 断言）。
+    // SH_CHAIN_FLOW=1 时：chain_flow 系统在后台 worker 跑完整链上流程，
+    // 完成后广播 ChainFlowResult 并发送 AppExit，App 自动退出（供 client_e2e.sh 断言）。
     // 否则：骨架循环运行（确定性 tick + 对象同步）。
-    let runner = if std::env::var("SH_CHAIN_FLOW").ok().as_deref() == Some("1") {
-        ScheduleRunnerPlugin::run_once()
-    } else {
-        ScheduleRunnerPlugin::run_loop(Duration::from_millis(100))
-    };
+    // 统一用 run_loop：网络 IO 在 worker 线程，主循环 100ms 一帧只做非阻塞 poll。
+    let runner = ScheduleRunnerPlugin::run_loop(Duration::from_millis(100));
 
     App::new()
         .add_plugins((

@@ -295,19 +295,21 @@ pub fn build_sell_drop_tx(
 }
 
 /// 本地确定性执行（与节点 gate/executor 同一函数 → 同一输出）。
-/// 需要链上规则配置（怪物表默认 v1 即可用于演示；强化走 EnhanceConfig）。
+/// 规则配置必须与链上对象一致（治理 `UpdateConfig` 可更新怪物表/强化表；
+/// `session.rules_version` 绑定链上配置版本，不一致会被 gate 拒绝）。
+/// 调用方从链上拉取配置（缺失时用 `Default` = v1 常量表，与旧行为逐位一致）。
 pub fn execute_locally(
     session: &rabbitcore::game::ActionSession,
     seed: u64,
+    enhance_cfg: &rabbitcore::game::EnhanceConfig,
+    monsters: &rabbitcore::game::MonsterTableConfig,
 ) -> Result<rabbitcore::game::ActionOutcome, rabbitcore::game::GameError> {
-    let enhance_cfg = rabbitcore::game::EnhanceConfig::default();
-    let monsters = shanhai_core::monster::MonsterTableConfig::default();
     rabbitcore::game::execute_action(
         &session.action_type,
         &session.inputs,
         seed,
-        &enhance_cfg,
-        &monsters,
+        enhance_cfg,
+        monsters,
     )
 }
 
@@ -406,7 +408,13 @@ mod tests {
         let wallet = demo_wallet();
         let (session, inputs) = demo_session(&wallet);
         let seed = 42u64;
-        let outcome = execute_locally(&session, seed).expect("local execute");
+        let outcome = execute_locally(
+            &session,
+            seed,
+            &rabbitcore::game::EnhanceConfig::default(),
+            &rabbitcore::game::MonsterTableConfig::default(),
+        )
+        .expect("local execute");
         let tx = build_action_settle_tx(
             &wallet,
             &session,

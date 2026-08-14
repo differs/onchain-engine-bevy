@@ -5,16 +5,24 @@
 //!
 //! 确定性契约：所有随机性来自 `shanhai-core` 的 `Prng`，seed 由调用方显式给定
 //! （生产环境由链上数据派生），保证服务端 / 链上执行器 / 客户端三方结果一致。
-//! 网络层：`rabbit_client::RpcClient` 直连节点 JSON-RPC（COMPUTE_JSON_SPEC.md），
-//! 本模块的 `sync_objects` 系统演示从链上拉取对象状态（如 Config 规则对象）。
+//! 网络层：`rabbit_client::RpcClient` 直连节点 JSON-RPC（COMPUTE_JSON_SPEC.md）。
+//!
+//! IO 模型（2026-08 重构）：**网络 IO 与 ECS 帧解耦**。`spawn_worker` 在独立线程
+//! 运行 tokio runtime，`ChainHandle` 只是请求通道；系统内**绝不** `block_on`，
+//! 而是持有 `PendingRpc` / `ChainFlowTask` 每帧非阻塞 `poll()`，结果通过
+//! bevy `Message`（`ObjectSynced` / `ChainFlowResult`）广播回 ECS。
 
-use bevy_app::{App, Update};
+use bevy_app::{App, AppExit, Update};
+use bevy_ecs::message::{Message, MessageWriter};
 use bevy_ecs::prelude::{Local, Res, ResMut, Resource};
 use bevy_log::info;
-use rabbit_client::RpcClient;
+use rabbit_client::{RpcClient, RpcError};
+use rabbitcore::compute::ObjectId;
 use rabbitcore::crypto::Hash;
-use rabbitcore::game::{ActionInput, ActionKind};
+use rabbitcore::game::{ActionInput, ActionKind, EnhanceConfig, MonsterTableConfig};
+use serde_json::{Value, json};
 use shanhai_core::battle::{Element, Team, Unit, resolve};
+use tokio::sync::{mpsc, oneshot};
 
 pub mod chain;
 
@@ -27,6 +35,9 @@ pub struct ChainConfig {
     pub object_id: Option<String>,
     /// 每 N 个 tick 拉取一次链上对象
     pub sync_every_ticks: u32,
+    /// 链 profile chain id（NETWORKS.md：local=31337 / testnet=10087 / devnet=10088 / mainnet=10086）。
+    /// 所有交易 `chain_id` 字段的来源；由 `SH_CHAIN_ID` 环境变量覆盖。
+    pub chain_id: u64,
 }
 
 impl Default for ChainConfig {
@@ -36,6 +47,7 @@ impl Default for ChainConfig {
             token: None,
             object_id: None,
             sync_every_ticks: 60,
+            chain_id: 10088,
         }
     }
 }
@@ -49,12 +61,153 @@ pub struct Simulator {
     pub last_rounds: u32,
 }
 
-/// 连接句柄：RpcClient + 本地 tokio runtime（bevy 系统内做阻塞式 RPC 调用）。
-#[derive(Resource)]
-pub struct ChainHandle {
-    pub client: RpcClient,
-    pub rt: tokio::runtime::Runtime,
+// ---------------------------------------------------------------------------
+// 异步 IO 基础设施：独立 worker 线程跑 tokio runtime，系统只做非阻塞轮询。
+// ---------------------------------------------------------------------------
+
+/// 发给 worker 的请求。
+enum ChainRequest {
+    /// 单次 RPC 调用（方法名 + 参数，应答走 oneshot）。
+    Rpc {
+        method: String,
+        params: Value,
+        reply: oneshot::Sender<Result<Value, RpcError>>,
+    },
+    /// 完整链上玩法闭环（`run_chain_flow`），完成后回复汇总摘要。
+    RunFlow {
+        rpc_url: String,
+        token: Option<String>,
+        chain_id: u64,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
 }
+
+/// 进行中的单次 RPC：系统内每帧 `poll()`，绝不阻塞。
+pub struct PendingRpc {
+    rx: oneshot::Receiver<Result<Value, RpcError>>,
+}
+
+impl PendingRpc {
+    /// 非阻塞取结果：`None` = 未就绪；`Some(Ok/Err)` = 已完成。
+    pub fn poll(&mut self) -> Option<Result<Value, RpcError>> {
+        match self.rx.try_recv() {
+            Ok(res) => Some(res),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(RpcError::BadResponse(
+                "chain worker closed".into(),
+            ))),
+        }
+    }
+}
+
+/// 进行中的完整链上玩法闭环：同上，帧内非阻塞轮询。
+pub struct ChainFlowTask {
+    rx: oneshot::Receiver<Result<String, String>>,
+}
+
+impl ChainFlowTask {
+    pub fn poll(&mut self) -> Option<Result<String, String>> {
+        match self.rx.try_recv() {
+            Ok(res) => Some(res),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Some(Err("chain worker closed".into()))
+            }
+        }
+    }
+}
+
+/// 连接句柄：只是通往 worker 的请求通道（线程安全），系统不持有任何阻塞原语。
+#[derive(Resource, Clone)]
+pub struct ChainHandle {
+    tx: mpsc::UnboundedSender<ChainRequest>,
+}
+
+impl ChainHandle {
+    /// 发起一次异步 RPC；`None` = worker 已不可用。
+    pub fn call(&self, method: impl Into<String>, params: Value) -> Option<PendingRpc> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ChainRequest::Rpc {
+                method: method.into(),
+                params,
+                reply,
+            })
+            .ok()?;
+        Some(PendingRpc { rx })
+    }
+
+    /// 后台启动完整链上玩法闭环（玩家钱包签名打怪→结算→卖掉落）。
+    pub fn spawn_chain_flow(
+        &self,
+        rpc_url: String,
+        token: Option<String>,
+        chain_id: u64,
+    ) -> Option<ChainFlowTask> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ChainRequest::RunFlow {
+                rpc_url,
+                token,
+                chain_id,
+                reply,
+            })
+            .ok()?;
+        Some(ChainFlowTask { rx })
+    }
+}
+
+/// 在独立线程启动 tokio runtime，消费请求队列。App 销毁时 channel 关闭，
+/// worker 主循环自然退出（在途任务随 runtime drop 丢弃，无泄漏）。
+fn spawn_worker(rpc_url: String, token: Option<String>) -> mpsc::UnboundedSender<ChainRequest> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ChainRequest>();
+    std::thread::Builder::new()
+        .name("chain-rpc-worker".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("chain rpc worker tokio runtime");
+            rt.block_on(async move {
+                let client = RpcClient::new(rpc_url, token);
+                while let Some(req) = rx.recv().await {
+                    match req {
+                        ChainRequest::Rpc { method, params, reply } => {
+                            let client = client.clone();
+                            tokio::spawn(async move {
+                                let _ = reply.send(client.call(&method, params).await);
+                            });
+                        }
+                        ChainRequest::RunFlow {
+                            rpc_url,
+                            token,
+                            chain_id,
+                            reply,
+                        } => {
+                            tokio::spawn(async move {
+                                let _ = reply.send(run_chain_flow(&rpc_url, token, chain_id).await);
+                            });
+                        }
+                    }
+                }
+            });
+        })
+        .expect("spawn chain rpc worker thread");
+    tx
+}
+
+/// 链上对象同步完成的广播（`sync_objects` 系统发出）。
+#[derive(Message, Debug, Clone)]
+pub struct ObjectSynced {
+    pub object_id: String,
+    pub value: Value,
+}
+
+/// 完整链上玩法闭环的终态广播（`chain_flow` 系统发出）。
+#[derive(Message, Debug, Clone)]
+pub struct ChainFlowResult(pub Result<String, String>);
 
 pub struct RabbitChainPlugin {
     pub config: ChainConfig,
@@ -76,18 +229,13 @@ impl RabbitChainPlugin {
 
 impl bevy_app::Plugin for RabbitChainPlugin {
     fn build(&self, app: &mut App) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("tokio runtime");
-        let handle = ChainHandle {
-            client: RpcClient::new(&self.config.rpc_url, self.config.token.clone()),
-            rt,
-        };
+        // 独立线程 + tokio runtime 处理所有网络 IO；系统侧只轮询结果。
+        let tx = spawn_worker(self.config.rpc_url.clone(), self.config.token.clone());
         app.insert_resource(self.config.clone())
             .insert_resource(Simulator::default())
-            .insert_resource(handle)
+            .insert_resource(ChainHandle { tx })
+            .add_message::<ObjectSynced>()
+            .add_message::<ChainFlowResult>()
             .add_systems(Update, (deterministic_tick, sync_objects, chain_flow));
     }
 }
@@ -123,40 +271,86 @@ fn deterministic_tick(mut sim: ResMut<Simulator>, chain: Res<ChainConfig>) {
     );
 }
 
-/// 链上对象同步：周期拉取 `rabbit_getObject`，本地持有真实链上状态（防客户端伪造资产）。
+/// 链上对象同步：非阻塞轮询 `rabbit_getObject`（后台 worker 执行，本系统只 poll）。
+/// 请求在途时每帧检查一次，完成后发出 `ObjectSynced` 消息（本地持有真实链上状态，
+/// 防客户端伪造资产）。
 fn sync_objects(
     mut tick: Local<u32>,
+    mut pending: Local<Option<PendingRpc>>,
     chain: Res<ChainConfig>,
     handle: Res<ChainHandle>,
+    mut synced: MessageWriter<ObjectSynced>,
 ) {
     let Some(object_id) = &chain.object_id else {
         return;
     };
-    *tick += 1;
-    if *tick % chain.sync_every_ticks.max(1) != 0 {
-        return;
+    if pending.is_none() {
+        *tick += 1;
+        if *tick % chain.sync_every_ticks.max(1) != 0 {
+            return;
+        }
+        match handle.call("rabbit_getObject", json!([object_id])) {
+            Some(p) => *pending = Some(p),
+            None => {
+                info!("[chain-sync] worker unavailable, retry next window");
+                return;
+            }
+        }
     }
-    match handle.rt.block_on(handle.client.get_object(object_id)) {
-        Ok(v) => info!("[chain-sync] object={object_id} => {v}"),
-        Err(e) => info!("[chain-sync] object={object_id} error={e}"),
+    if let Some(p) = pending.as_mut() {
+        if let Some(res) = p.poll() {
+            let _ = pending.take();
+            match res {
+                Ok(v) => {
+                    info!("[chain-sync] object={object_id} => {v}");
+                    synced.write(ObjectSynced {
+                        object_id: object_id.clone(),
+                        value: v,
+                    });
+                }
+                Err(e) => info!("[chain-sync] object={object_id} error={e}"),
+            }
+        }
     }
 }
 
 /// 客户端全链玩法流程（#4）：玩家本地钱包签名 ActionStart → ActionSettle → SellDrop。
-/// 由 `SH_CHAIN_FLOW=1` 环境变量触发（无节点时跳过，骨架保持可运行）。
+/// 由 `SH_CHAIN_FLOW=1` 环境变量触发：流程在后台 worker 执行，本系统每帧轮询，
+/// 完成后广播 `ChainFlowResult` 并退出 App（无节点时骨架保持可运行）。
 fn chain_flow(
-    mut done: Local<bool>,
+    mut task: Local<Option<ChainFlowTask>>,
     chain: Res<ChainConfig>,
     handle: Res<ChainHandle>,
+    mut result_msg: MessageWriter<ChainFlowResult>,
+    mut exit: MessageWriter<AppExit>,
 ) {
-    if *done || std::env::var("SH_CHAIN_FLOW").ok().as_deref() != Some("1") {
+    if std::env::var("SH_CHAIN_FLOW").ok().as_deref() != Some("1") {
         return;
     }
-    *done = true;
-    info!("[chain-flow] starting full on-chain gameplay loop");
-    match handle.rt.block_on(run_chain_flow(&chain.rpc_url, chain.token.clone())) {
-        Ok(summary) => info!("[chain-flow] PASS: {summary}"),
-        Err(e) => info!("[chain-flow] FAIL: {e}"),
+    if task.is_none() {
+        match handle.spawn_chain_flow(chain.rpc_url.clone(), chain.token.clone(), chain.chain_id) {
+            Some(t) => {
+                info!("[chain-flow] spawning background full on-chain gameplay loop");
+                *task = Some(t);
+            }
+            None => {
+                info!("[chain-flow] FAIL: worker unavailable");
+                result_msg.write(ChainFlowResult(Err("worker unavailable".into())));
+                exit.write(AppExit::Success);
+                return;
+            }
+        }
+    }
+    if let Some(t) = task.as_mut() {
+        if let Some(result) = t.poll() {
+            match &result {
+                Ok(summary) => info!("[chain-flow] PASS: {summary}"),
+                Err(e) => info!("[chain-flow] FAIL: {e}"),
+            }
+            result_msg.write(ChainFlowResult(result));
+            // SH_CHAIN_FLOW=1 是"跑完即退"模式：闭环终结后结束 App。
+            exit.write(AppExit::Success);
+        }
     }
 }
 
@@ -165,17 +359,18 @@ fn chain_flow(
 pub async fn run_chain_flow(
     rpc_url: &str,
     token: Option<String>,
+    chain_id: u64,
 ) -> Result<String, String> {
     let client = RpcClient::new(rpc_url, token.clone());
     let seed_bytes = hex::decode("11".repeat(32)).map_err(|e| format!("seed: {e}"))?;
     let player = chain::PlayerWallet::derive(&seed_bytes, 9001);
     // A：玩家原生余额自举（gas 真实扣除）
-    let _ = client
+    client
         .fund_account(&format!("0x{}", hex::encode(player.address().as_bytes())), 10_000_000)
         .await
         .map_err(|e| format!("fund native: {e}"))?;
     // 国库 SHC 池：掉落变现资金（testkit 水龙头注入）
-    let _ = client
+    client
         .fund_token(
             &format!("0x{}", hex::encode(rabbitcore::governance::treasury_address().as_bytes())),
             10_000,
@@ -183,24 +378,38 @@ pub async fn run_chain_flow(
         )
         .await
         .map_err(|e| format!("fund treasury: {e}"))?;
-    let base_fee = fetch_base_fee(&client).await;
-    let nonce = chrono::Utc::now().timestamp_millis() as u64;
-    let session_id = format!("client-{}", nonce);
+    let base_fee = fetch_base_fee(&client).await?;
+    let nonce = next_nonce();
+    let session_id = format!("client-{nonce}");
     let created_at = chrono::Utc::now().timestamp().saturating_sub(120).max(1) as u64;
 
-    // 0) 链上怪物表（权威规则）：读不到则铸造默认 v1（Mint 免 gas，玩家签名）。
-    //    battle 的 gate/executor 校验 session.rules_version == 链上配置版本。
-    if let Err(_) = client
-        .get_object(&format!(
-            "0x{}",
-            hex::encode(rabbitcore::game::monster_config_object_id().0.as_bytes())
-        ))
+    // 0) 链上怪物表（权威规则）：`rabbit_getObject` 对缺失对象返回 null → mint 默认 v1
+    //    （Mint 免 gas，玩家签名）；网络错误 → fail-loud（不静默 mint，避免掩盖故障）。
+    let monsters_cfg = match client
+        .get_object(&object_id_hex(rabbitcore::game::monster_config_object_id()))
         .await
     {
-        info!("[chain-flow] monster config missing, minting default v1");
-        let mint_cfg = chain::build_mint_monster_config_tx(&player, nonce, 10088);
-        let _ = submit_and_wait(&mint_cfg, rpc_url, token.clone()).await?;
-    }
+        Ok(v) if v.is_null() => {
+            info!("[chain-flow] monster config missing, minting default v1");
+            let mint_cfg = chain::build_mint_monster_config_tx(&player, nonce, chain_id);
+            let _ = submit_and_wait(&mint_cfg, rpc_url, token.clone()).await?;
+            MonsterTableConfig::default()
+        }
+        Ok(v) => parse_config_obj::<MonsterTableConfig>(&v, "monster config")?,
+        Err(e) => return Err(format!("get monster config: {e}")),
+    };
+    // 强化配置：同样以链上对象为权威（缺失用默认 v1；网络错误 fail-loud）。
+    let enhance_cfg = match client
+        .get_object(&object_id_hex(rabbitcore::game::enhance_config_object_id()))
+        .await
+    {
+        Ok(v) if v.is_null() => EnhanceConfig::default(),
+        Ok(v) => parse_config_obj::<EnhanceConfig>(&v, "enhance config")?,
+        Err(e) => return Err(format!("get enhance config: {e}")),
+    };
+    // rules_version 绑定链上配置版本：gate/executor 校验
+    // `session.rules_version == 链上配置版本`，不一致直接拒绝。
+    let rules_version = monsters_cfg.version;
 
     // 1) ActionStart：Mint session（玩家 owner）
     let action_type = ActionKind::Battle;
@@ -212,7 +421,7 @@ pub async fn run_chain_flow(
         session_id: session_id.clone(),
         action_type: action_type.clone(),
         inputs: inputs.clone(),
-        rules_version: 1,
+        rules_version,
         creator: format!("0x{}", hex::encode(player.address().as_bytes())),
         created_at_unix: created_at,
         settled: false,
@@ -224,28 +433,21 @@ pub async fn run_chain_flow(
         action_type.clone(),
         inputs.clone(),
         created_at,
-        1,
+        rules_version,
         nonce,
-        10088,
+        chain_id,
     );
     let _start_res = submit_and_wait(&start, rpc_url, token.clone()).await?;
 
-    // 2) 随机揭晓：最新真实链块哈希（先承诺后揭晓，防挑 seed）
-    let latest = client.latest_block().await.map_err(|e| format!("latest: {e}"))?;
-    let block_hash = latest
-        .get("hash")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| "latest block missing hash".to_string())?
-        .to_string();
-    let block_hash_bytes = hex::decode(block_hash.trim_start_matches("0x"))
-        .map_err(|e| format!("block hash hex: {e}"))?;
-    let seed = rabbitcore::game::derive_action_seed(
-        &Hash::from_bytes(block_hash_bytes.as_slice().try_into().map_err(|_| "bad hash len")?),
-        &session_id,
-    );
+    // 2) 随机揭晓：latest-2 稳定块哈希（先承诺后揭晓，防挑 seed）。
+    //    不用 latest：快速矿工可在同一高度重挖覆盖，gate 按 hash 查块会找不到。
+    let (block_hash, seed) = fetch_stable_random_block(&client, &session_id).await?;
 
-    // 3) 本地确定性执行（真实战斗引擎，与节点同一函数）
-    let outcome = chain::execute_locally(&session, seed).map_err(|e| format!("execute: {e}"))?;
+    // 3) 本地确定性执行（真实战斗引擎 + 链上配置，与节点同一函数）
+    let outcome =
+        chain::execute_locally(&session, seed, &enhance_cfg, &monsters_cfg).map_err(|e| {
+            format!("execute: {e}")
+        })?;
     let drops = outcome.drops.clone();
 
     // 4) ActionSettle：Invoke 消费 session v1 → v2 + 掉落对象（玩家签名）
@@ -258,7 +460,7 @@ pub async fn run_chain_flow(
         drops,
         player.address(),
         nonce + 1,
-        10088,
+        chain_id,
         base_fee,
     );
     let settle_res = submit_and_wait(&settle, rpc_url, token.clone()).await?;
@@ -276,7 +478,7 @@ pub async fn run_chain_flow(
             &session_id,
             &drop.item_id,
             nonce + 2,
-            10088,
+            chain_id,
             base_fee,
         );
         let sell_res = submit_and_wait(&sell, rpc_url, token.clone()).await?;
@@ -291,17 +493,79 @@ pub async fn run_chain_flow(
     ))
 }
 
-/// 从 `rabbit_gasPrice` 读取 base fee（失败回退 devnet 初始值 1）。
-async fn fetch_base_fee(client: &RpcClient) -> u64 {
-    match client.gas_price().await {
-        Ok(v) => v
-            .get("base_fee")
-            .and_then(|x| x.as_str())
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .or_else(|| v.get("base_fee_shc").and_then(|x| x.as_u64()))
-            .unwrap_or(1),
-        Err(_) => 1,
+/// 逻辑对象 id → `rabbit_getObject` 参数（0x 前缀 hex）。
+fn object_id_hex(id: ObjectId) -> String {
+    format!("0x{}", hex::encode(id.0.as_bytes()))
+}
+
+/// 解析 `rabbit_getObject` 返回：`state` = hex(serde_json bytes)（对象序列化格式）。
+/// 解析失败 fail-loud（对象损坏不应静默回退默认配置，否则本地执行与链上重算不一致）。
+fn parse_config_obj<T: serde::de::DeserializeOwned>(v: &Value, what: &str) -> Result<T, String> {
+    let state = v
+        .get("state")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("{what}: missing state"))?;
+    let bytes = hex::decode(state.trim_start_matches("0x"))
+        .map_err(|e| format!("{what}: state hex decode: {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("{what}: state parse: {e}"))
+}
+
+/// 取**稳定块**作为动作随机源（与服务端 `settle.rs::fetch_stable_random_block` 同模式）：
+/// `latest-2` 已确认、不会被同高度重写，且时间戳仍 >= session.created_at
+/// （创建回拨 120s），先承诺后揭晓语义不变。返回 (block_hash_hex, seed)。
+async fn fetch_stable_random_block(
+    client: &RpcClient,
+    session_id: &str,
+) -> Result<(String, u64), String> {
+    let latest = client.latest_block().await.map_err(|e| format!("latest: {e}"))?;
+    let latest_number = latest
+        .get("number")
+        .and_then(|x| x.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    let stable_number = latest_number.saturating_sub(2).max(1);
+    let stable = client
+        .get_block_by_number(stable_number)
+        .await
+        .map_err(|e| format!("stable block {stable_number}: {e}"))?;
+    if stable.is_null() {
+        // 节点按高度查不到该块（高度不足或已从热存储淘汰）——fail-loud，不挑块。
+        return Err(format!("stable block {stable_number} not found"));
     }
+    let block_hash_hex = stable
+        .get("hash")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "stable block missing hash".to_string())?
+        .to_string();
+    let block_hash_bytes = hex::decode(block_hash_hex.trim_start_matches("0x"))
+        .map_err(|e| format!("block hash hex: {e}"))?;
+    let block_hash = Hash::from_bytes(
+        block_hash_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad block hash len".to_string())?,
+    );
+    let seed = rabbitcore::game::derive_action_seed(&block_hash, session_id);
+    Ok((block_hash_hex, seed))
+}
+
+/// 并发安全 nonce：毫秒时间戳 << 16 | 自增序号。
+/// 同一毫秒内最多 65536 个不重复 nonce，多会话并发不碰撞。
+fn next_nonce() -> u64 {
+    static NONCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    (ms << 16) | (NONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFFFF)
+}
+
+/// 从 `rabbit_gasPrice` 读取 base fee。失败 fail-loud：静默回退 1 会低估
+/// `max_fee`，导致交易在区块执行时被拒（费用不足），报错误导。
+async fn fetch_base_fee(client: &RpcClient) -> Result<u64, String> {
+    let v = client.gas_price().await.map_err(|e| format!("gas price: {e}"))?;
+    v.get("base_fee")
+        .and_then(|x| x.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .or_else(|| v.get("base_fee_shc").and_then(|x| x.as_u64()))
+        .ok_or_else(|| format!("gas price response missing base_fee: {v}"))
 }
 
 /// BlockTime 提交 + 轮询：提交后轮询 `rabbit_getComputeTxResult` 直到真结果。
@@ -356,5 +620,72 @@ mod tests {
         let cfg = ChainConfig::default();
         assert!(cfg.object_id.is_none());
         assert_eq!(cfg.sync_every_ticks, 60);
+        assert_eq!(cfg.chain_id, 10088);
+    }
+
+    #[test]
+    fn parse_config_obj_roundtrips_monster_table() {
+        let cfg = MonsterTableConfig::default();
+        let state = serde_json::to_vec(&cfg).unwrap();
+        let obj = serde_json::json!({
+            "object_id": "0xab",
+            "state": format!("0x{}", hex::encode(&state)),
+        });
+        let parsed: MonsterTableConfig = parse_config_obj(&obj, "monster config").expect("parse");
+        assert_eq!(parsed, cfg);
+        // 缺失 state 或损坏 → fail-loud
+        assert!(parse_config_obj::<MonsterTableConfig>(&json!({}), "monster config").is_err());
+        assert!(parse_config_obj::<MonsterTableConfig>(
+            &json!({"state": "0xzz"}),
+            "monster config"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn next_nonce_is_unique_across_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let n = next_nonce();
+            assert!(seen.insert(n), "nonce {n} 重复");
+        }
+    }
+
+    #[test]
+    fn pending_rpc_returns_none_while_in_flight() {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut pending = PendingRpc { rx };
+        // 发送者存活但未应答 → 未就绪（系统每帧 poll，不阻塞）
+        assert!(pending.poll().is_none());
+    }
+
+    #[test]
+    fn pending_rpc_surfaces_result_when_answered() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut pending = PendingRpc { rx };
+        assert!(pending.poll().is_none());
+        let _ = tx.send(Ok(serde_json::json!({"ok": true})));
+        let result = pending.poll().expect("answered");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn pending_rpc_surfaces_closed_channel() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx); // worker 死亡 = 通道关闭
+        let mut pending = PendingRpc { rx };
+        let result = pending.poll().expect("closed channel should yield a result");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn chain_flow_task_polls_to_completion() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut task = ChainFlowTask { rx };
+        assert!(task.poll().is_none());
+        let _ = tx.send(Ok("start=OK settle_outputs=2".into()));
+        let result = task.poll().expect("answered");
+        assert_eq!(result.unwrap(), "start=OK settle_outputs=2");
     }
 }
